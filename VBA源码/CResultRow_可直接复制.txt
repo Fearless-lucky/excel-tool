@@ -1,0 +1,9 @@
+Option Explicit
+
+Public assetNo As String
+Public prevNet As Variant
+Public dep As Variant
+Public Net As Variant
+Public ChangeDesc As String
+Public CheckMsg As String
+Public Severity As Long

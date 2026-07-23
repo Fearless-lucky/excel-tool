@@ -1,0 +1,16 @@
+Option Explicit
+
+Public kind As String
+Public assetNo As String
+Public Category As String
+Public UnitName As String
+Public Quantity As Variant
+Public Cost As Variant
+Public Years As Variant
+Public Salvage As Variant
+Public monthly As Variant
+Public PurchaseDate As Variant
+Public Location As String
+Public Department As String
+Public Note As String
+Public RowNo As Long

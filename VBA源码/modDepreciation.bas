@@ -1,0 +1,1533 @@
+Attribute VB_Name = "modDepreciation"
+Option Explicit
+
+'=====================================================================
+' 月度折旧生成工具  ver1.3
+' 完全离线运行；不修改上月原文件；输出新的 .xlsx 文件
+' 本模块为工具全部代码，无 UserForm、无 ActiveX、无外部组件
+'=====================================================================
+
+'---------------- 界面常量 ----------------
+Private Const SHEET_HOME As String = "操作首页"
+Private Const SHEET_PREVIEW As String = "检查预览"
+
+Private Const CELL_PATH As String = "B5"        '上月文件路径
+Private Const CELL_SHEET As String = "B6"       '最新月度工作表名
+Private Const CELL_PREV As String = "E6"        '上月期间
+Private Const CELL_CURR As String = "G6"        '本月期间
+Private Const CELL_RULE_NEW As String = "J5"    '新增资产起提时间
+Private Const CELL_RULE_MIN As String = "J6"    '最低净值
+Private Const CELL_RULE_SCRAP As String = "J7"  '报废或停用当月
+Private Const CELL_STATUS As String = "B26"     '状态栏
+
+Private Const CHG_FIRST_ROW As Long = 11        '变动表首行
+Private Const CHG_LAST_ROW As Long = 20         '变动表末行
+
+'---------------- 月度表列号 ----------------
+Private Const C_CAT As Long = 1     'A 固定资产类别
+Private Const C_CHG As Long = 2     'B 变动方式
+Private Const C_NO As Long = 3      'C 财产编号
+Private Const C_UNIT As Long = 4    'D 计量单位
+Private Const C_QTY As Long = 5     'E 数量
+Private Const C_COST As Long = 6    'F 原值
+Private Const C_NET0 As Long = 7    'G 净值（初始）
+Private Const C_LOC As Long = 8     'H 保存地点
+Private Const C_DEPT As Long = 9    'I 使用部门及个人
+Private Const C_MEMO As Long = 10   'J 摘要
+Private Const C_BUYDATE As Long = 11 'K 购买日期
+Private Const C_YEARS As Long = 12  'L 使用年限
+Private Const C_MONTHLY As Long = 13 'M 月均折旧
+Private Const C_DEP As Long = 14    'N 本月折旧额
+Private Const C_NET As Long = 15    'O 本月末净值
+Private Const C_SALV As Long = 16   'P 预计净残值（工具隐藏列）
+
+Private Const HDR_ROW As Long = 2
+Private Const FIRST_DATA_ROW As Long = 3
+Private Const PERIOD_CELL As String = "N1"
+
+'---------------- 规则选项文字 ----------------
+Public Const OPT_NEW_NOW As String = "当月开始计提"
+Public Const OPT_NEW_NEXT As String = "次月开始计提"
+Public Const OPT_MIN_ZERO As String = "最低净值为 0"
+Public Const OPT_MIN_SALV As String = "按预计净残值"
+Public Const OPT_SCRAP_YES As String = "当月仍计提折旧"
+Public Const OPT_SCRAP_NO As String = "当月不计提折旧"
+
+'---------------- 变动类型 ----------------
+Private Const K_NONE As String = "无变动"
+Private Const K_NEW As String = "新增"
+Private Const K_ADJ As String = "调整"
+Private Const K_SCRAP As String = "报废"
+Private Const K_STOP As String = "停用"
+
+'---------------- 记录对象 ----------------
+'CChangeItem 与 CResultRow 使用类对象，以便安全存入 Collection，
+'避免 VBA 将用户定义类型强制转换为 Variant 时产生编译错误。
+
+'---------------- 应用状态保存 ----------------
+Private mOldScreen As Boolean
+Private mOldEvents As Boolean
+Private mOldCalc As XlCalculation
+Private mOldAlerts As Boolean
+Private mAppSaved As Boolean
+Private mToolWorkbook As Workbook
+Private mHomeSheet As Worksheet
+
+'=====================================================================
+' 按钮入口一：选择上月折旧表
+'=====================================================================
+Public Sub SelectSource()
+    On Error GoTo Fail
+    BindToolWorkbook
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = "请选择上月折旧表"
+        .AllowMultiSelect = False
+        .Filters.Clear
+        .Filters.Add "Excel 工作簿", "*.xlsx;*.xlsm;*.xls", 1
+        If .Show <> -1 Then Exit Sub
+        LoadSourceFile .SelectedItems(1)
+    End With
+    Exit Sub
+Fail:
+    AppEnd
+    MsgBox "选择文件时出错：" & Err.Description, vbExclamation, "月度折旧生成工具"
+End Sub
+
+'=====================================================================
+' 按钮入口二：检查并预览
+'=====================================================================
+Public Sub CheckAndPreview()
+    BindToolWorkbook
+    RunPreview True
+End Sub
+
+'=====================================================================
+' 按钮入口三：生成本月折旧表
+'=====================================================================
+Public Sub GenerateMonth()
+    BindToolWorkbook
+    GenerateCore "", True
+End Sub
+
+'=====================================================================
+' 按钮入口四：清空
+'=====================================================================
+Public Sub ClearAll()
+    On Error GoTo Fail
+    BindToolWorkbook
+    AppBegin
+    With Home
+        .Range(CELL_PATH).MergeArea.ClearContents
+        .Range(CELL_SHEET).MergeArea.ClearContents
+        .Range(CELL_PREV).MergeArea.ClearContents
+        .Range(CELL_CURR).MergeArea.ClearContents
+        .Range("A" & CHG_FIRST_ROW & ":M" & CHG_LAST_ROW).ClearContents
+        .Range(CELL_STATUS).MergeArea.ClearContents
+    End With
+    DeletePreviewSheet
+    SetStatus "已清空。请重新选择上月折旧表。", False
+    AppEnd
+    Exit Sub
+Fail:
+    AppEnd
+    MsgBox "清空时出错：" & Err.Description, vbExclamation, "月度折旧生成工具"
+End Sub
+
+'=====================================================================
+' 打开工具时初始化首页：固定 100% 缩放并回到左上角
+'=====================================================================
+Public Sub FitHomeView()
+    On Error Resume Next
+    BindToolWorkbook
+    Home.Activate
+    ActiveWindow.FreezePanes = False
+    ActiveWindow.Zoom = 100
+    Home.Range("A1").Select
+    ActiveWindow.ScrollRow = 1
+    ActiveWindow.ScrollColumn = 1
+    On Error GoTo 0
+End Sub
+
+'打开时执行无交互初始化：定位首页后保护版式，仅保留规则和变动表可填写。
+Public Sub InitializeHome()
+    On Error Resume Next
+    BindToolWorkbook
+    FitHomeView
+    ProtectHomeSheet
+    On Error GoTo 0
+End Sub
+
+'=====================================================================
+' 载入上月文件（识别最新月度工作表与期间），成功返回 True
+'=====================================================================
+Public Function LoadSourceFile(ByVal path As String) As Boolean
+    On Error GoTo Fail
+    'WPS 在打开源工作簿后可能改变 ThisWorkbook 的解析对象；必须在此之前固定工具本身。
+    BindToolWorkbook
+    AppBegin
+    If Not FileExists(path) Then
+        SetStatus "文件不存在：" & path, True
+        GoTo Done
+    End If
+    Dim wb As Workbook, ws As Worksheet
+    Dim y As Long, m As Long, ny As Long, nm As Long
+    Set wb = OpenSource(path)
+    If Not FindLatestMonthlySheet(wb, ws, y, m) Then
+        wb.Close SaveChanges:=False
+        ClearFileInfo
+        SetStatus "未找到名称符合 YYYY.MM 格式的月度工作表（如 2026.01）。", True
+        GoTo Done
+    End If
+    NextPeriod y, m, ny, nm
+    Dim wsName As String
+    wsName = ws.Name
+    With Home
+        .Range(CELL_PATH).Value = path
+        .Range(CELL_SHEET).Value = wsName
+        .Range(CELL_PREV).Value = PeriodText(y, m)
+        .Range(CELL_CURR).Value = PeriodText(ny, nm)
+    End With
+    wb.Close SaveChanges:=False
+    SetStatus "已选择上月折旧表，识别到月度工作表「" & wsName & "」。可点击「检查并预览」或「生成本月折旧表」。", False
+    LoadSourceFile = True
+Done:
+    AppEnd
+    Exit Function
+Fail:
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+    AppEnd
+    ClearFileInfo
+    SetStatus "选择文件失败[" & Err.Number & "]：" & Err.Description, True
+End Function
+
+'=====================================================================
+' 检查并预览（核心），返回严重错误数
+'=====================================================================
+Public Function RunPreview(ByVal showUi As Boolean) As Long
+    On Error GoTo Fail
+    BindToolWorkbook
+    AppBegin
+    Dim path As String, ruleNew As String, ruleMin As String, ruleScrap As String
+    path = SafeText(Home.Range(CELL_PATH))
+    ruleNew = SafeText(Home.Range(CELL_RULE_NEW))
+    ruleMin = SafeText(Home.Range(CELL_RULE_MIN))
+    ruleScrap = SafeText(Home.Range(CELL_RULE_SCRAP))
+
+    If Len(path) = 0 Then
+        SetStatus "请先选择上月折旧表。", True
+        If showUi Then MsgBox "请先点击「选择上月折旧表」选择文件。", vbExclamation, "月度折旧生成工具"
+        GoTo Done
+    End If
+    If Not FileExists(path) Then
+        SetStatus "上月文件不存在：" & path, True
+        If showUi Then MsgBox "上月文件不存在：" & vbCrLf & path, vbExclamation, "月度折旧生成工具"
+        GoTo Done
+    End If
+    If Not RulesValid(ruleNew, ruleMin, ruleScrap) Then
+        SetStatus "请完整选择三项折旧规则。", True
+        If showUi Then MsgBox "请在「折旧规则」中完整选择三项规则。", vbExclamation, "月度折旧生成工具"
+        GoTo Done
+    End If
+
+    Dim items As Collection, errs As Collection, notes As Collection, results As Collection
+    Set notes = New Collection
+    Set results = New Collection
+    ReadChanges items, errs
+
+    Dim wb As Workbook, ws As Worksheet
+    Dim y As Long, m As Long, ny As Long, nm As Long
+    Set wb = OpenSource(path)
+    If Not FindLatestMonthlySheet(wb, ws, y, m) Then
+        errs.Add "源工作簿中未找到名称符合 YYYY.MM 格式的月度工作表（如 2026.01）。"
+        wb.Close SaveChanges:=False
+        WritePreviewSheet results, errs, notes, 0, 0, 0, 0
+        SetStatus "未找到月度工作表，无法检查。", True
+        If showUi Then MsgBox "未找到月度工作表，无法检查。", vbCritical, "月度折旧生成工具"
+        RunPreview = errs.Count
+        GoTo Done
+    End If
+
+    NextPeriod y, m, ny, nm
+    With Home
+        .Range(CELL_SHEET).Value = ws.Name
+        .Range(CELL_PREV).Value = PeriodText(y, m)
+        .Range(CELL_CURR).Value = PeriodText(ny, nm)
+    End With
+
+    Dim severe As Long
+    severe = ProcessSheet(ws, items, ruleNew, ruleMin, ruleScrap, False, results, errs, notes)
+    If severe = 0 And errs.Count = 0 Then
+        If Not WriteFullMonthPreview(ws, items, ruleNew, ruleMin, ruleScrap, ny, nm, errs) Then
+            severe = 1
+        End If
+    End If
+    wb.Close SaveChanges:=False
+
+    If severe > 0 Or errs.Count > 0 Then
+        WritePreviewSheet results, errs, notes, y, m, ny, nm
+        RunPreview = Application.Max(severe, errs.Count)
+        SetStatus "检查完成：发现 " & severe & " 处严重错误，禁止生成。详见「" & SHEET_PREVIEW & "」。", True
+        If showUi Then
+            ToolWorkbook.Worksheets(SHEET_PREVIEW).Activate
+            MsgBox "检查发现 " & severe & " 处严重错误，禁止生成本月折旧表。" & vbCrLf & vbCrLf & _
+                   FirstErrors(errs, results, 8), vbCritical, "月度折旧生成工具"
+        End If
+    Else
+        RunPreview = 0
+        Dim warnCnt As Long
+        warnCnt = notes.Count + CountSeverity(results, 1)
+        SetStatus "检查完成：完整本月表预览已生成，可以生成。（资产 " & results.Count & " 项，提示 " & warnCnt & " 条）", False
+        If showUi Then
+            ToolWorkbook.Worksheets(SHEET_PREVIEW).Activate
+            MsgBox "检查通过，已生成完整本月折旧表预览。" & vbCrLf & "共 " & results.Count & " 项资产，" & _
+                   warnCnt & " 条提示。预览表已包含完整格式、明细、合计及本月变动结果。", vbInformation, "月度折旧生成工具"
+        End If
+    End If
+Done:
+    AppEnd
+    Exit Function
+Fail:
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+    AppEnd
+    SetStatus "检查时出错[" & Err.Number & "]：" & Err.Description, True
+    If showUi Then MsgBox "检查时出错[" & Err.Number & "]：" & Err.Description, vbCritical, "月度折旧生成工具"
+End Function
+
+'=====================================================================
+' 生成本月折旧表（核心），成功返回 True
+' outFolder 为空且 interactive=True 时，询问保存位置
+'=====================================================================
+Public Function GenerateCore(ByVal outFolder As String, ByVal interactive As Boolean) As Boolean
+    On Error GoTo Fail
+    BindToolWorkbook
+    AppBegin
+    Dim path As String, ruleNew As String, ruleMin As String, ruleScrap As String
+    path = SafeText(Home.Range(CELL_PATH))
+    ruleNew = SafeText(Home.Range(CELL_RULE_NEW))
+    ruleMin = SafeText(Home.Range(CELL_RULE_MIN))
+    ruleScrap = SafeText(Home.Range(CELL_RULE_SCRAP))
+
+    If Len(path) = 0 Or Not FileExists(path) Then
+        SetStatus "请先选择上月折旧表。", True
+        If interactive Then MsgBox "请先点击「选择上月折旧表」选择文件。", vbExclamation, "月度折旧生成工具"
+        GoTo Done
+    End If
+    If Not RulesValid(ruleNew, ruleMin, ruleScrap) Then
+        SetStatus "请完整选择三项折旧规则。", True
+        If interactive Then MsgBox "请在「折旧规则」中完整选择三项规则。", vbExclamation, "月度折旧生成工具"
+        GoTo Done
+    End If
+
+    '---- 1. 生成前检查（只读，不修改原文件）----
+    Dim items As Collection, errs As Collection, notes As Collection, results As Collection
+    Set notes = New Collection
+    Set results = New Collection
+    ReadChanges items, errs
+
+    Dim wb As Workbook, ws As Worksheet
+    Dim y As Long, m As Long, ny As Long, nm As Long
+    Set wb = OpenSource(path)
+    If Not FindLatestMonthlySheet(wb, ws, y, m) Then
+        errs.Add "源工作簿中未找到名称符合 YYYY.MM 格式的月度工作表（如 2026.01）。"
+        wb.Close SaveChanges:=False
+        WritePreviewSheet results, errs, notes, 0, 0, 0, 0
+        SetStatus "未找到月度工作表，禁止生成。", True
+        If interactive Then MsgBox "未找到月度工作表，禁止生成。", vbCritical, "月度折旧生成工具"
+        GoTo Done
+    End If
+    NextPeriod y, m, ny, nm
+    With Home
+        .Range(CELL_SHEET).Value = ws.Name
+        .Range(CELL_PREV).Value = PeriodText(y, m)
+        .Range(CELL_CURR).Value = PeriodText(ny, nm)
+    End With
+
+    Dim severe As Long
+    severe = ProcessSheet(ws, items, ruleNew, ruleMin, ruleScrap, False, results, errs, notes)
+    wb.Close SaveChanges:=False
+
+    If severe > 0 Then
+        WritePreviewSheet results, errs, notes, y, m, ny, nm
+        SetStatus "存在 " & severe & " 处严重错误，已禁止生成。详见「" & SHEET_PREVIEW & "」。", True
+        If interactive Then
+            ToolWorkbook.Worksheets(SHEET_PREVIEW).Activate
+            MsgBox "检查发现 " & severe & " 处严重错误，禁止生成本月折旧表。" & vbCrLf & vbCrLf & _
+                   FirstErrors(errs, results, 8), vbCritical, "月度折旧生成工具"
+        End If
+        GoTo Done
+    End If
+
+    '---- 2. 确定输出位置 ----
+    Dim srcFolder As String
+    srcFolder = ParentFolder(path)
+    If interactive Then
+        Dim ans As VbMsgBoxResult
+        ans = MsgBox("即将生成本月折旧表：折旧表_" & PeriodName(ny, nm) & ".xlsx" & vbCrLf & vbCrLf & _
+                     "是否保存到上月文件所在文件夹？" & vbCrLf & srcFolder & vbCrLf & vbCrLf & _
+                     "【是】保存到该文件夹    【否】选择其他文件夹    【取消】放弃生成", _
+                     vbYesNoCancel + vbQuestion, "月度折旧生成工具")
+        If ans = vbCancel Then
+            SetStatus "已取消生成。", False
+            GoTo Done
+        End If
+        If ans = vbYes Then
+            outFolder = srcFolder
+        Else
+            outFolder = PickFolder()
+            If Len(outFolder) = 0 Then
+                SetStatus "已取消生成。", False
+                GoTo Done
+            End If
+        End If
+    Else
+        If Len(outFolder) = 0 Then outFolder = srcFolder
+    End If
+
+    Dim outPath As String
+    outPath = outFolder & "\折旧表_" & PeriodName(ny, nm) & ".xlsx"
+
+    If FileExists(outPath) Then
+        If interactive Then
+            If MsgBox("文件已存在：" & vbCrLf & outPath & vbCrLf & vbCrLf & "是否覆盖？", _
+                      vbYesNo + vbExclamation, "月度折旧生成工具") <> vbYes Then
+                SetStatus "已取消生成。", False
+                GoTo Done
+            End If
+        End If
+        On Error Resume Next
+        Kill outPath
+        On Error GoTo Fail
+        If FileExists(outPath) Then
+            SetStatus "无法覆盖输出文件（可能正被打开）：" & outPath, True
+            If interactive Then MsgBox "无法覆盖输出文件，请先关闭它：" & vbCrLf & outPath, vbCritical, "月度折旧生成工具"
+            GoTo Done
+        End If
+    End If
+
+    '---- 3. 完整复制工作簿并转换为 xlsx（保留全部工作表、格式与打印设置）----
+    Set wb = OpenSource(path)
+    Application.DisplayAlerts = False
+    wb.SaveAs Filename:=outPath, FileFormat:=xlOpenXMLWorkbook
+    Application.DisplayAlerts = True
+    wb.Close SaveChanges:=False
+
+    Dim wbOut As Workbook, wsLatest As Worksheet
+    Set wbOut = Application.Workbooks.Open(Filename:=outPath, UpdateLinks:=0)
+    If Not FindLatestMonthlySheet(wbOut, wsLatest, y, m) Then
+        wbOut.Close SaveChanges:=False
+        Kill outPath
+        SetStatus "复制后的工作簿中未找到月度工作表，生成失败。", True
+        GoTo Done
+    End If
+    NextPeriod y, m, ny, nm
+
+    Dim newName As String
+    newName = PeriodName(ny, nm)
+    If SheetExists(wbOut, newName) Then
+        wbOut.Close SaveChanges:=False
+        Kill outPath
+        SetStatus "源工作簿中已存在工作表「" & newName & "」，无法生成。", True
+        If interactive Then MsgBox "源工作簿中已存在工作表「" & newName & "」，无法生成。", vbCritical, "月度折旧生成工具"
+        GoTo Done
+    End If
+
+    '---- 4. 复制最新月度表并改名 ----
+    wsLatest.Copy After:=wbOut.Sheets(wbOut.Sheets.Count)
+    Dim wsNew As Worksheet
+    Set wsNew = wbOut.Sheets(wbOut.Sheets.Count)
+    wsNew.Name = newName
+    wsNew.Range(PERIOD_CELL).Value = DateSerial(ny, nm, 1)
+    '沿用源表的中文月份展示方式，例如“2026年2月”。
+    wsNew.Range(PERIOD_CELL).NumberFormat = "yyyy""年""m""月"""
+
+    '---- 5. 折旧计算与变动处理（写回新模式）----
+    Dim results2 As Collection, errs2 As Collection, notes2 As Collection
+    Set results2 = New Collection
+    Set errs2 = New Collection
+    Set notes2 = New Collection
+    Dim severe2 As Long
+    severe2 = ProcessSheet(wsNew, items, ruleNew, ruleMin, ruleScrap, True, results2, errs2, notes2)
+    wsNew.Calculate
+    Dim newTotalRow As Long
+    newTotalRow = FindTotalRow(wsNew)
+    If newTotalRow > 0 Then ScanFormulaErrors wsNew, newTotalRow, errs2
+    If severe2 > 0 Or errs2.Count > 0 Then
+        wbOut.Close SaveChanges:=False
+        On Error Resume Next
+        Kill outPath
+        On Error GoTo Fail
+        SetStatus "生成后的自检未通过，未保留输出文件：" & FirstErrors(errs2, results2, 6), True
+        If interactive Then MsgBox "生成后的自检未通过，输出文件已取消。" & vbCrLf & vbCrLf & _
+                                   FirstErrors(errs2, results2, 6), vbCritical, "月度折旧生成工具"
+        GoTo Done
+    End If
+
+    '---- 6. 另存为 xlsx ----
+    Application.DisplayAlerts = False
+    wbOut.SaveAs Filename:=outPath, FileFormat:=xlOpenXMLWorkbook
+    Application.DisplayAlerts = True
+    wbOut.Close SaveChanges:=False
+
+    SetStatus "生成完成：" & outPath, False
+    If interactive Then
+        Home.Activate
+        MsgBox "本月折旧表已生成：" & vbCrLf & outPath & vbCrLf & vbCrLf & _
+               "上月原文件未被修改。", vbInformation, "月度折旧生成工具"
+    End If
+    GenerateCore = True
+Done:
+    AppEnd
+    Exit Function
+Fail:
+    On Error Resume Next
+    If Not wbOut Is Nothing Then wbOut.Close SaveChanges:=False
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+    AppEnd
+    SetStatus "生成失败[" & Err.Number & "]：" & Err.Description, True
+    If interactive Then MsgBox "生成失败[" & Err.Number & "]：" & Err.Description, vbCritical, "月度折旧生成工具"
+End Function
+
+'=====================================================================
+' 折旧计算与变动处理核心
+' writeMode=False 只计算（预览）；writeMode=True 写回单元格（生成）
+' 返回严重错误数；结果写入 results，全局错误写入 errs，提示写入 notes
+'=====================================================================
+Private Function ProcessSheet(ByVal ws As Worksheet, ByVal items As Collection, _
+        ByVal ruleNew As String, ByVal ruleMin As String, ByVal ruleScrap As String, _
+        ByVal writeMode As Boolean, ByVal results As Collection, _
+        ByVal errs As Collection, ByVal notes As Collection) As Long
+
+    If results Is Nothing Then Set results = New Collection
+    If errs Is Nothing Then Set errs = New Collection
+    If notes Is Nothing Then Set notes = New Collection
+    If items Is Nothing Then Set items = New Collection
+
+    Dim rowSevere As Long
+
+    '---- 合计行 ----
+    Dim totalRow As Long
+    totalRow = FindTotalRow(ws)
+    If totalRow = 0 Then
+        errs.Add "工作表「" & ws.Name & "」中未找到合计行（A列应为「合计」）。"
+        ProcessSheet = errs.Count
+        Exit Function
+    End If
+
+    '---- 表头 ----
+    Dim hdrErrBefore As Long
+    hdrErrBefore = errs.Count
+    CheckHeaders ws, errs
+    If errs.Count > hdrErrBefore Then
+        ProcessSheet = errs.Count
+        Exit Function
+    End If
+
+    '---- 公式错误 ----
+    ScanFormulaErrors ws, totalRow, errs
+
+    '---- 期间单元格 ----
+    If Not IsDate(ws.Range(PERIOD_CELL).Value) Then
+        notes.Add PERIOD_CELL & " 期间单元格不是有效日期，生成时将按本月期间重新写入。"
+    End If
+
+    '---- 残值列 ----
+    Dim hasSalvCol As Boolean
+    hasSalvCol = (SafeText(ws.Cells(HDR_ROW, C_SALV)) = "预计净残值")
+    If writeMode Then
+        EnsureSalvageColumn ws
+        hasSalvCol = True
+    End If
+
+    Dim seen As New Collection
+    Dim lastData As Long
+    lastData = totalRow - 1
+
+    Dim r As Long, c As Long
+    Dim rowBlank As Boolean
+    Dim assetNo As String
+    Dim cost0 As Double, years0 As Double
+    Dim prevNet As Double, monthly As Double, salv As Double
+    Dim floorVal As Double, dep As Double, netAfter As Double
+    Dim inactive As Boolean, chgIdx As Long
+    Dim it As CChangeItem, res As CResultRow
+    Dim kind As String
+
+    For r = FIRST_DATA_ROW To lastData
+        '跳过完全空白行
+        rowBlank = True
+        For c = 1 To C_NET
+            If Len(SafeText(ws.Cells(r, c))) > 0 Then
+                rowBlank = False
+                Exit For
+            End If
+        Next
+        If rowBlank Then GoTo NextAsset
+
+        Set res = New CResultRow
+        res.assetNo = AssetNoOf(ws.Cells(r, C_NO))
+        res.Severity = 0
+        res.CheckMsg = "正常"
+        res.ChangeDesc = "无"
+        res.prevNet = ""
+        res.dep = ""
+        res.Net = ""
+        assetNo = res.assetNo
+
+        If Len(assetNo) = 0 Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：财产编号为空。"
+            GoTo PushResult
+        End If
+        If SeenAdd(seen, assetNo) Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：财产编号「" & assetNo & "」重复。"
+            GoTo PushResult
+        End If
+        If Not TryGetNum(ws.Cells(r, C_NET), prevNet, False) Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：上月净值（O列）不是有效数值。"
+            GoTo PushResult
+        End If
+        If prevNet < 0 Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：上月净值小于 0（" & Format$(prevNet, "0.00") & "）。"
+            GoTo PushResult
+        End If
+        If Not TryGetNum(ws.Cells(r, C_COST), cost0, False) Or cost0 <= 0 Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：原值（F列）必须为大于 0 的有效数字。"
+            GoTo PushResult
+        End If
+        If Not TryGetNum(ws.Cells(r, C_YEARS), years0, False) Or years0 <= 0 Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：使用年限（L列）必须为大于 0 的有效数字。"
+            GoTo PushResult
+        End If
+        If Not TryGetNum(ws.Cells(r, C_MONTHLY), monthly, False) Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：月均折旧（M列）不是有效数值。"
+            GoTo PushResult
+        End If
+        If monthly < 0 Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：月均折旧不能为负数。"
+            GoTo PushResult
+        End If
+
+        Dim missingInfo As String, qty0 As Double
+        missingInfo = ""
+        If Len(SafeText(ws.Cells(r, C_CAT))) = 0 Then missingInfo = missingInfo & "固定资产类别、"
+        If Len(SafeText(ws.Cells(r, C_UNIT))) = 0 Then missingInfo = missingInfo & "计量单位、"
+        If Not TryGetNum(ws.Cells(r, C_QTY), qty0, False) Or qty0 <= 0 Then missingInfo = missingInfo & "数量、"
+        If Len(SafeText(ws.Cells(r, C_BUYDATE))) = 0 Then missingInfo = missingInfo & "购买日期、"
+        If Len(SafeText(ws.Cells(r, C_LOC))) = 0 Then missingInfo = missingInfo & "保存地点、"
+        If Len(SafeText(ws.Cells(r, C_DEPT))) = 0 Then missingInfo = missingInfo & "使用部门及个人、"
+        If Len(missingInfo) > 0 Then
+            notes.Add "第 " & r & " 行（财产编号 " & assetNo & "）基础资料为空或无效：" & _
+                      Left$(missingInfo, Len(missingInfo) - 1) & "。本次仍可生成，建议核实源表。"
+        End If
+
+        salv = 0
+        If hasSalvCol Then
+            Dim tmpV As Double
+            If TryGetNum(ws.Cells(r, C_SALV), tmpV, True) Then salv = tmpV
+        End If
+        If ruleMin = OPT_MIN_SALV Then floorVal = salv Else floorVal = 0
+
+        inactive = (InStr(SafeText(ws.Cells(r, C_CHG)), "报废") > 0) Or _
+                   (InStr(SafeText(ws.Cells(r, C_CHG)), "停用") > 0) Or _
+                   (InStr(SafeText(ws.Cells(r, C_MEMO)), "报废") > 0) Or _
+                   (InStr(SafeText(ws.Cells(r, C_MEMO)), "停用") > 0)
+
+        kind = ""
+        chgIdx = FindChange(items, assetNo)
+        If chgIdx > 0 Then
+            Set it = items(chgIdx)
+            kind = it.kind
+            If kind = K_NEW Then
+                res.Severity = 2
+                res.CheckMsg = "第 " & r & " 行：变动表中「新增」的财产编号「" & assetNo & "」已存在。"
+                GoTo PushResult
+            End If
+            If kind = K_ADJ Then
+                If Not IsEmpty(it.Cost) Then cost0 = CDbl(it.Cost)
+                If Not IsEmpty(it.Years) Then years0 = CDbl(it.Years)
+                If Not IsEmpty(it.monthly) Then monthly = CDbl(it.monthly)
+                If Not IsEmpty(it.Salvage) Then
+                    salv = CDbl(it.Salvage)
+                    If ruleMin = OPT_MIN_SALV Then floorVal = salv
+                End If
+                If salv > cost0 Then
+                    res.Severity = 2
+                    res.CheckMsg = "第 " & r & " 行：调整后的预计净残值不能大于原值。"
+                    GoTo PushResult
+                End If
+                If writeMode Then
+                    If Len(it.Category) > 0 Then ws.Cells(r, C_CAT).Value = it.Category
+                    If Len(it.UnitName) > 0 Then ws.Cells(r, C_UNIT).Value = it.UnitName
+                    If Not IsEmpty(it.Quantity) Then ws.Cells(r, C_QTY).Value = CDbl(it.Quantity)
+                    If Not IsEmpty(it.Cost) Then ws.Cells(r, C_COST).Value = CDbl(it.Cost)
+                    If Not IsEmpty(it.Years) Then ws.Cells(r, C_YEARS).Value = CDbl(it.Years)
+                    If Not IsEmpty(it.monthly) Then ws.Cells(r, C_MONTHLY).Value = CDbl(it.monthly)
+                    If Not IsEmpty(it.Salvage) Then ws.Cells(r, C_SALV).Value = salv
+                    If Not IsEmpty(it.PurchaseDate) Then ws.Cells(r, C_BUYDATE).Value = it.PurchaseDate
+                    If Len(it.Location) > 0 Then ws.Cells(r, C_LOC).Value = it.Location
+                    If Len(it.Department) > 0 Then ws.Cells(r, C_DEPT).Value = it.Department
+                    MarkChange ws, r, "调整"
+                    If Len(it.Note) > 0 Then AppendMemo ws, r, it.Note
+                End If
+                res.ChangeDesc = "调整"
+            ElseIf kind = K_SCRAP Or kind = K_STOP Then
+                If writeMode Then
+                    MarkChange ws, r, kind
+                    If Len(it.Note) > 0 Then AppendMemo ws, r, it.Note
+                End If
+                res.ChangeDesc = kind
+            End If
+        End If
+
+        If inactive Then
+            dep = 0
+            If res.ChangeDesc = "无" Then res.ChangeDesc = "已报废/停用"
+            res.Severity = 1
+            res.CheckMsg = "提示：该资产已报废或停用，本月不计提折旧。"
+        ElseIf (kind = K_SCRAP Or kind = K_STOP) And ruleScrap = OPT_SCRAP_NO Then
+            dep = 0
+            res.CheckMsg = "正常（报废/停用当月不计提）"
+        Else
+            dep = CalcDep(prevNet, monthly, floorVal)
+            If floorVal > 0 And prevNet <= floorVal Then
+                res.Severity = 1
+                res.CheckMsg = "提示：上月净值已达到或低于最低净值，本月不计提。"
+            End If
+        End If
+        netAfter = Round2(prevNet - dep)
+        If netAfter < floorVal Then
+            res.Severity = 2
+            res.CheckMsg = "第 " & r & " 行：折旧后净值低于最低净值。"
+            GoTo PushResult
+        End If
+
+        If writeMode Then
+            ws.Cells(r, C_DEP).Value = dep
+            ws.Cells(r, C_NET).Value = netAfter
+        End If
+        res.prevNet = prevNet
+        res.dep = dep
+        res.Net = netAfter
+
+PushResult:
+        results.Add res
+        If res.Severity = 2 Then rowSevere = rowSevere + 1
+NextAsset:
+    Next r
+
+    '---- 新增资产 ----
+    Dim k As Long
+    Dim cost2 As Double, years2 As Double, salv2 As Double, mon2 As Double, qty2 As Double
+    Dim fv2 As Double, dep2 As Double, net2 As Double
+    For k = 1 To items.Count
+        Set it = items(k)
+        If it.kind <> K_NEW Then GoTo NextNew
+        Set res = New CResultRow
+        res.assetNo = it.assetNo
+        res.Severity = 0
+        res.CheckMsg = "正常"
+        res.ChangeDesc = "新增"
+        res.prevNet = ""
+        res.dep = ""
+        res.Net = ""
+        '若编号已在原月度表中出现，前面的资产检查已给出唯一错误，
+        '此处不再重复追加同一条“新增编号已存在”错误。
+        If SeenExists(seen, it.assetNo) Then GoTo NextNew
+        If SeenAdd(seen, it.assetNo) Then
+            res.Severity = 2
+            res.CheckMsg = "变动表第 " & it.RowNo & " 行：新增的财产编号「" & it.assetNo & "」已存在。"
+            GoTo PushNew
+        End If
+        cost2 = CDbl(it.Cost)
+        years2 = CDbl(it.Years)
+        If IsEmpty(it.Quantity) Then qty2 = 1 Else qty2 = CDbl(it.Quantity)
+        If Not IsEmpty(it.Salvage) Then salv2 = CDbl(it.Salvage) Else salv2 = 0
+        If salv2 > cost2 Then
+            res.Severity = 2
+            res.CheckMsg = "变动表第 " & it.RowNo & " 行：预计净残值不能大于原值。"
+            GoTo PushNew
+        End If
+        If Not IsEmpty(it.monthly) Then
+            mon2 = CDbl(it.monthly)
+        Else
+            mon2 = Round2((cost2 - salv2) / years2 / 12)
+        End If
+        If ruleMin = OPT_MIN_SALV Then fv2 = salv2 Else fv2 = 0
+        If ruleNew = OPT_NEW_NOW Then
+            dep2 = CalcDep(cost2, mon2, fv2)
+        Else
+            dep2 = 0
+            res.CheckMsg = "正常（次月开始计提，本月折旧为 0）"
+        End If
+        net2 = Round2(cost2 - dep2)
+        If writeMode Then
+            ws.Rows(totalRow).Insert Shift:=xlDown, CopyOrigin:=xlFormatFromLeftOrAbove
+            ws.Cells(totalRow, C_CAT).Value = it.Category
+            ws.Cells(totalRow, C_CHG).Value = "新增"
+            ws.Cells(totalRow, C_NO).NumberFormat = "@"
+            ws.Cells(totalRow, C_NO).Value = it.assetNo
+            ws.Cells(totalRow, C_UNIT).Value = it.UnitName
+            ws.Cells(totalRow, C_QTY).Value = qty2
+            ws.Cells(totalRow, C_COST).Value = cost2
+            ws.Cells(totalRow, C_NET0).Value = cost2
+            ws.Cells(totalRow, C_LOC).Value = it.Location
+            ws.Cells(totalRow, C_DEPT).Value = it.Department
+            If Len(it.Note) > 0 Then ws.Cells(totalRow, C_MEMO).Value = it.Note
+            ws.Cells(totalRow, C_BUYDATE).Value = it.PurchaseDate
+            ws.Cells(totalRow, C_YEARS).Value = years2
+            ws.Cells(totalRow, C_MONTHLY).Value = mon2
+            ws.Cells(totalRow, C_DEP).Value = dep2
+            ws.Cells(totalRow, C_NET).Value = net2
+            ws.Cells(totalRow, C_SALV).Value = salv2
+            totalRow = totalRow + 1
+        End If
+        res.prevNet = cost2
+        res.dep = dep2
+        res.Net = net2
+PushNew:
+        results.Add res
+        If res.Severity = 2 Then rowSevere = rowSevere + 1
+NextNew:
+    Next k
+
+    '---- 合计行公式 ----
+    If writeMode Then
+        Dim ld As Long
+        ld = totalRow - 1
+        If ld < FIRST_DATA_ROW Then ld = FIRST_DATA_ROW
+        ws.Cells(totalRow, C_DEP).Formula = "=SUM(N" & FIRST_DATA_ROW & ":N" & ld & ")"
+        ws.Cells(totalRow, C_NET).Formula = "=SUM(O" & FIRST_DATA_ROW & ":O" & ld & ")"
+    End If
+
+    '---- 变动表中未匹配到资产的 调整/报废/停用 ----
+    For k = 1 To items.Count
+        Set it = items(k)
+        If it.kind = K_ADJ Or it.kind = K_SCRAP Or it.kind = K_STOP Then
+            If Not SeenExists(seen, it.assetNo) Then
+                errs.Add "变动表第 " & it.RowNo & " 行：财产编号「" & it.assetNo & "」在月度表中不存在（" & it.kind & "）。"
+            End If
+        End If
+    Next k
+
+    ProcessSheet = errs.Count + rowSevere
+End Function
+
+'=====================================================================
+' 读取首页「本月资产变动」表
+'=====================================================================
+Private Sub ReadChanges(ByRef items As Collection, ByRef errs As Collection)
+    Set items = New Collection
+    Set errs = New Collection
+    Dim ws As Worksheet
+    Set ws = Home
+    Dim r As Long, c As Long
+    Dim kind As String, hasAny As Boolean
+    Dim it As CChangeItem
+
+    For r = CHG_FIRST_ROW To CHG_LAST_ROW
+        kind = SafeText(ws.Cells(r, 1))
+        hasAny = (Len(kind) > 0)
+        For c = 2 To 13
+            If Len(SafeText(ws.Cells(r, c))) > 0 Then hasAny = True
+        Next
+        If Not hasAny Then GoTo NextRow
+
+        If Len(kind) = 0 Then
+            errs.Add "变动表第 " & r & " 行：已填写内容但未选择变动类型。"
+            GoTo NextRow
+        End If
+        If kind = K_NONE Then GoTo NextRow
+        If kind <> K_NEW And kind <> K_ADJ And kind <> K_SCRAP And kind <> K_STOP Then
+            errs.Add "变动表第 " & r & " 行：变动类型「" & kind & "」无效，请使用下拉选项。"
+            GoTo NextRow
+        End If
+
+        Set it = New CChangeItem
+        it.kind = kind
+        it.RowNo = r
+        it.assetNo = AssetNoOf(ws.Cells(r, 2))
+        it.Category = SafeText(ws.Cells(r, 3))
+        it.UnitName = SafeText(ws.Cells(r, 4))
+        it.Quantity = ws.Cells(r, 5).Value
+        it.Cost = ws.Cells(r, 6).Value
+        it.Years = ws.Cells(r, 7).Value
+        it.Salvage = ws.Cells(r, 8).Value
+        it.monthly = ws.Cells(r, 9).Value
+        it.PurchaseDate = ws.Cells(r, 10).Value
+        it.Location = SafeText(ws.Cells(r, 11))
+        it.Department = SafeText(ws.Cells(r, 12))
+        it.Note = SafeText(ws.Cells(r, 13))
+
+        If Len(it.assetNo) = 0 Then
+            errs.Add "变动表第 " & r & " 行：财产编号不能为空。"
+            GoTo NextRow
+        End If
+        If Not IsEmpty(it.Quantity) Then
+            If Not IsPositiveNumber(it.Quantity) Then
+                errs.Add "变动表第 " & r & " 行：数量必须为大于 0 的数字。"
+                GoTo NextRow
+            End If
+        End If
+        If Not IsEmpty(it.Cost) Then
+            If Not IsPositiveNumber(it.Cost) Then
+                errs.Add "变动表第 " & r & " 行：原值必须为大于 0 的数字。"
+                GoTo NextRow
+            End If
+        End If
+        If Not IsEmpty(it.Years) Then
+            If Not IsPositiveNumber(it.Years) Then
+                errs.Add "变动表第 " & r & " 行：使用年限必须为大于 0 的数字。"
+                GoTo NextRow
+            End If
+        End If
+        If Not IsEmpty(it.Salvage) Then
+            If Not IsNonNegativeNumber(it.Salvage) Then
+                errs.Add "变动表第 " & r & " 行：预计净残值必须为不小于 0 的数字。"
+                GoTo NextRow
+            End If
+        End If
+        If Not IsEmpty(it.monthly) Then
+            If Not IsPositiveNumber(it.monthly) Then
+                errs.Add "变动表第 " & r & " 行：月均折旧必须为大于 0 的数字。"
+                GoTo NextRow
+            End If
+        End If
+        If kind = K_NEW Then
+            If Len(it.Category) = 0 Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写固定资产类别。"
+                GoTo NextRow
+            End If
+            If Len(it.UnitName) = 0 Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写计量单位。"
+                GoTo NextRow
+            End If
+            If IsEmpty(it.Cost) Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写原值。"
+                GoTo NextRow
+            End If
+            If IsEmpty(it.Years) Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写使用年限，以保证后续月份可继续生成。"
+                GoTo NextRow
+            End If
+            If IsEmpty(it.PurchaseDate) Or Len(Trim$(CStr(it.PurchaseDate))) = 0 Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写购买日期。"
+                GoTo NextRow
+            End If
+            If Len(it.Location) = 0 Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写保存地点。"
+                GoTo NextRow
+            End If
+            If Len(it.Department) = 0 Then
+                errs.Add "变动表第 " & r & " 行：新增资产必须填写使用部门及个人。"
+                GoTo NextRow
+            End If
+        End If
+        If kind = K_ADJ Then
+            If Len(it.Category) = 0 And Len(it.UnitName) = 0 And IsEmpty(it.Quantity) And _
+               IsEmpty(it.Cost) And IsEmpty(it.Years) And IsEmpty(it.Salvage) And _
+               IsEmpty(it.monthly) And IsEmpty(it.PurchaseDate) And Len(it.Location) = 0 And _
+               Len(it.Department) = 0 And Len(it.Note) = 0 Then
+                errs.Add "变动表第 " & r & " 行：调整时至少填写一项需要更新的内容。"
+                GoTo NextRow
+            End If
+        End If
+        items.Add it
+NextRow:
+    Next r
+
+    '表内编号重复检查
+    Dim i As Long, j As Long
+    Dim a As CChangeItem, b As CChangeItem
+    For i = 1 To items.Count
+        Set a = items(i)
+        For j = i + 1 To items.Count
+            Set b = items(j)
+            If a.assetNo = b.assetNo Then
+                errs.Add "变动表中财产编号「" & a.assetNo & "」重复出现（第 " & a.RowNo & " 行与第 " & b.RowNo & " 行）。"
+            End If
+        Next
+    Next
+End Sub
+
+'=====================================================================
+' 生成完整「检查预览」：复制上月完整月表，仅在工具内模拟本月结果
+'=====================================================================
+Private Function WriteFullMonthPreview(ByVal wsSource As Worksheet, ByVal items As Collection, _
+        ByVal ruleNew As String, ByVal ruleMin As String, ByVal ruleScrap As String, _
+        ByVal ny As Long, ByVal nm As Long, ByRef errs As Collection) As Boolean
+    On Error GoTo Fail
+
+    DeletePreviewSheet
+    wsSource.Copy After:=ToolWorkbook.Worksheets(ToolWorkbook.Worksheets.Count)
+
+    Dim wsPreview As Worksheet
+    Set wsPreview = ToolWorkbook.Worksheets(ToolWorkbook.Worksheets.Count)
+    wsPreview.Name = SHEET_PREVIEW
+    wsPreview.Tab.Color = RGB(128, 128, 128)
+    wsPreview.Range(PERIOD_CELL).Value = DateSerial(ny, nm, 1)
+    wsPreview.Range(PERIOD_CELL).NumberFormat = "yyyy""年""m""月"""
+
+    Dim previewResults As Collection, previewErrs As Collection, previewNotes As Collection
+    Set previewResults = New Collection
+    Set previewErrs = New Collection
+    Set previewNotes = New Collection
+
+    Dim severe As Long, totalRow As Long, i As Long
+    severe = ProcessSheet(wsPreview, items, ruleNew, ruleMin, ruleScrap, True, _
+                          previewResults, previewErrs, previewNotes)
+    wsPreview.Calculate
+    totalRow = FindTotalRow(wsPreview)
+    If totalRow > 0 Then ScanFormulaErrors wsPreview, totalRow, previewErrs
+
+    If severe > 0 Or previewErrs.Count > 0 Then
+        If errs Is Nothing Then Set errs = New Collection
+        For i = 1 To previewErrs.Count
+            errs.Add "完整本月预览自检失败：" & previewErrs(i)
+        Next
+        DeletePreviewSheet
+        Exit Function
+    End If
+
+    WriteFullMonthPreview = True
+    Exit Function
+Fail:
+    If errs Is Nothing Then Set errs = New Collection
+    errs.Add "无法生成完整本月预览：" & Err.Description
+    On Error Resume Next
+    DeletePreviewSheet
+    On Error GoTo 0
+End Function
+
+'=====================================================================
+' 生成错误时使用的「检查预览」诊断表
+'=====================================================================
+Private Sub WritePreviewSheet(ByVal results As Collection, ByVal errs As Collection, _
+        ByVal notes As Collection, ByVal y As Long, ByVal m As Long, _
+        ByVal ny As Long, ByVal nm As Long)
+    DeletePreviewSheet
+    Dim ws As Worksheet
+    Set ws = ToolWorkbook.Worksheets.Add(After:=ToolWorkbook.Worksheets(ToolWorkbook.Worksheets.Count))
+    ws.Name = SHEET_PREVIEW
+    ws.Tab.Color = RGB(128, 128, 128)
+
+    With ws.Range("A1")
+        .Value = "检查预览"
+        .Font.Bold = True
+        .Font.Size = 14
+        .Font.Color = RGB(31, 78, 121)
+    End With
+    If y > 0 Then
+        ws.Range("A2").Value = "上月期间：" & PeriodText(y, m) & "      本月期间：" & PeriodText(ny, nm) & _
+                               "      检查时间：" & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    Else
+        ws.Range("A2").Value = "检查时间：" & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    End If
+    ws.Range("A2").Font.Color = RGB(89, 89, 89)
+
+    Dim r As Long, i As Long
+    r = 4
+
+    If Not errs Is Nothing Then
+        If errs.Count > 0 Then
+            With ws.Cells(r, 1)
+                .Value = "严重错误（禁止生成）"
+                .Font.Bold = True
+                .Font.Color = RGB(192, 0, 0)
+            End With
+            r = r + 1
+            For i = 1 To errs.Count
+                ws.Cells(r, 1).Value = "· " & errs(i)
+                ws.Cells(r, 1).Font.Color = RGB(192, 0, 0)
+                r = r + 1
+            Next
+            r = r + 1
+        End If
+    End If
+
+    If Not notes Is Nothing Then
+        If notes.Count > 0 Then
+            With ws.Cells(r, 1)
+                .Value = "提示"
+                .Font.Bold = True
+                .Font.Color = RGB(156, 101, 0)
+            End With
+            r = r + 1
+            For i = 1 To notes.Count
+                ws.Cells(r, 1).Value = "· " & notes(i)
+                ws.Cells(r, 1).Font.Color = RGB(156, 101, 0)
+                r = r + 1
+            Next
+            r = r + 1
+        End If
+    End If
+
+    Dim hdrRow As Long
+    hdrRow = r
+    ws.Columns("A").NumberFormat = "@"
+    Dim heads As Variant
+    heads = Array("财产编号", "上月净值", "本月折旧", "本月净值", "变动情况", "检查结果")
+    For i = 0 To 5
+        ws.Cells(hdrRow, i + 1).Value = heads(i)
+    Next
+    With ws.Range(ws.Cells(hdrRow, 1), ws.Cells(hdrRow, 6))
+        .Font.Bold = True
+        .Interior.Color = RGB(189, 215, 238)
+        .Borders.LineStyle = xlContinuous
+        .Borders.Weight = xlThin
+    End With
+    r = hdrRow + 1
+
+    If Not results Is Nothing Then
+        Dim res As CResultRow
+        For i = 1 To results.Count
+            Set res = results(i)
+            ws.Cells(r, 1).Value = res.assetNo
+            If IsNumeric(res.prevNet) Then ws.Cells(r, 2).Value = CDbl(res.prevNet)
+            If IsNumeric(res.dep) Then ws.Cells(r, 3).Value = CDbl(res.dep)
+            If IsNumeric(res.Net) Then ws.Cells(r, 4).Value = CDbl(res.Net)
+            ws.Cells(r, 5).Value = res.ChangeDesc
+            ws.Cells(r, 6).Value = res.CheckMsg
+            With ws.Range(ws.Cells(r, 1), ws.Cells(r, 6))
+                .Borders.LineStyle = xlContinuous
+                .Borders.Weight = xlThin
+                .Borders.Color = RGB(191, 191, 191)
+                If res.Severity = 2 Then
+                    .Interior.Color = RGB(255, 199, 206)
+                ElseIf res.Severity = 1 Then
+                    .Interior.Color = RGB(255, 235, 156)
+                End If
+            End With
+            r = r + 1
+        Next
+    End If
+
+    Dim errRows As Long, warnRows As Long, totalRows As Long
+    errRows = CountSeverity(results, 2)
+    warnRows = CountSeverity(results, 1)
+    If results Is Nothing Then totalRows = 0 Else totalRows = results.Count
+    ws.Cells(r + 1, 1).Value = "共 " & totalRows & " 项资产；正常 " & (totalRows - errRows - warnRows) & _
+                               " 项，提示 " & warnRows & " 项，错误 " & errRows & " 项。"
+    ws.Cells(r + 1, 1).Font.Bold = True
+
+    ws.Range("B" & hdrRow & ":D" & Application.Max(r, hdrRow + 1)).NumberFormat = "#,##0.00"
+    ws.Columns("A").ColumnWidth = 14
+    ws.Columns("B").ColumnWidth = 12
+    ws.Columns("C").ColumnWidth = 12
+    ws.Columns("D").ColumnWidth = 12
+    ws.Columns("E").ColumnWidth = 14
+    ws.Columns("F").ColumnWidth = 56
+End Sub
+
+'=====================================================================
+' 工具函数
+'=====================================================================
+Private Function Home() As Worksheet
+    BindToolWorkbook
+    Set Home = mHomeSheet
+End Function
+
+'固定工具工作簿及首页工作表。WPS 打开源工作簿后会切换当前工作簿上下文，
+'若继续直接使用 ThisWorkbook，文件路径等首页信息可能被写入只读源文件后丢失。
+Private Sub BindToolWorkbook()
+    If mHomeSheet Is Nothing Then
+        Set mHomeSheet = ThisWorkbook.Worksheets(SHEET_HOME)
+        Set mToolWorkbook = mHomeSheet.Parent
+    End If
+End Sub
+
+Private Function ToolWorkbook() As Workbook
+    BindToolWorkbook
+    Set ToolWorkbook = mToolWorkbook
+End Function
+
+Private Sub SetStatus(ByVal msg As String, ByVal isErr As Boolean)
+    On Error Resume Next
+    With Home.Range(CELL_STATUS)
+        .Value = msg
+        If isErr Then
+            .Font.Color = RGB(192, 0, 0)
+        Else
+            .Font.Color = RGB(0, 128, 0)
+        End If
+    End With
+    On Error GoTo 0
+End Sub
+
+Private Sub ClearFileInfo()
+    On Error Resume Next
+    With Home
+        .Range(CELL_SHEET).MergeArea.ClearContents
+        .Range(CELL_PREV).MergeArea.ClearContents
+        .Range(CELL_CURR).MergeArea.ClearContents
+    End With
+    On Error GoTo 0
+End Sub
+
+Private Sub AppBegin()
+    On Error Resume Next
+    If mAppSaved Then Exit Sub
+    mOldScreen = Application.ScreenUpdating
+    mOldEvents = Application.EnableEvents
+    mOldCalc = Application.Calculation
+    mOldAlerts = Application.DisplayAlerts
+    mAppSaved = True
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    On Error GoTo 0
+End Sub
+
+Private Sub AppEnd()
+    On Error Resume Next
+    If Not mAppSaved Then Exit Sub
+    Application.ScreenUpdating = mOldScreen
+    Application.EnableEvents = mOldEvents
+    Application.Calculation = mOldCalc
+    Application.DisplayAlerts = mOldAlerts
+    mAppSaved = False
+End Sub
+
+Private Function Round2(ByVal v As Double) As Double
+    Round2 = Application.WorksheetFunction.Round(v, 2)
+End Function
+
+Private Function CalcDep(ByVal prevNet As Double, ByVal monthly As Double, ByVal floorVal As Double) As Double
+    Dim d As Double, avail As Double
+    d = monthly
+    If d < 0 Then d = 0
+    avail = prevNet - floorVal
+    If avail < 0 Then avail = 0
+    If d > avail Then d = avail
+    CalcDep = Round2(d)
+End Function
+
+Public Function TryParsePeriod(ByVal s As String, ByRef y As Long, ByRef m As Long) As Boolean
+    s = Trim$(s)
+    If Len(s) <> 7 Then Exit Function
+    If Mid$(s, 5, 1) <> "." Then Exit Function
+    If Not IsNumeric(Left$(s, 4)) Then Exit Function
+    If Not IsNumeric(Right$(s, 2)) Then Exit Function
+    y = CLng(Left$(s, 4))
+    m = CLng(Right$(s, 2))
+    If y < 1900 Or y > 9999 Then Exit Function
+    If m < 1 Or m > 12 Then Exit Function
+    TryParsePeriod = True
+End Function
+
+Private Sub NextPeriod(ByVal y As Long, ByVal m As Long, ByRef ny As Long, ByRef nm As Long)
+    ny = y
+    nm = m + 1
+    If nm > 12 Then
+        nm = 1
+        ny = ny + 1
+    End If
+End Sub
+
+Private Function PeriodName(ByVal y As Long, ByVal m As Long) As String
+    PeriodName = Format$(y, "0000") & "." & Format$(m, "00")
+End Function
+
+Private Function PeriodText(ByVal y As Long, ByVal m As Long) As String
+    PeriodText = y & "年" & m & "月"
+End Function
+
+Private Function FindLatestMonthlySheet(ByVal wb As Workbook, ByRef wsOut As Worksheet, _
+        ByRef yOut As Long, ByRef mOut As Long) As Boolean
+    Dim ws As Worksheet
+    Dim y As Long, m As Long
+    Dim best As Long
+    best = -1
+    For Each ws In wb.Worksheets
+        If TryParsePeriod(ws.Name, y, m) Then
+            If y * 12 + m > best Then
+                best = y * 12 + m
+                Set wsOut = ws
+                yOut = y
+                mOut = m
+            End If
+        End If
+    Next
+    FindLatestMonthlySheet = Not wsOut Is Nothing
+End Function
+
+Private Function FindTotalRow(ByVal ws As Worksheet) As Long
+    Dim lastR As Long, r As Long
+    lastR = ws.Cells(ws.Rows.Count, C_CAT).End(xlUp).Row
+    For r = FIRST_DATA_ROW To lastR
+        If SafeText(ws.Cells(r, C_CAT)) = "合计" Then
+            FindTotalRow = r
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Sub CheckHeaders(ByVal ws As Worksheet, ByRef errs As Collection)
+    Dim exp As Variant
+    exp = Array("固定资产类别", "变动方式", "财产编号", "计量单位", "数量", "原值", "净值", _
+                "保存地点", "使用部门及个人", "摘要", "购买日期", "使用年限", "月均折旧")
+    Dim i As Long, actual As String
+    For i = 0 To 12
+        actual = SafeText(ws.Cells(HDR_ROW, i + 1))
+        If actual <> exp(i) Then
+            errs.Add "工作表「" & ws.Name & "」表头 " & Chr$(65 + i) & "2 应为「" & exp(i) & "」，实际为「" & actual & "」。"
+        End If
+    Next
+    If InStr(SafeText(ws.Cells(HDR_ROW, C_DEP)), "折旧额") = 0 Then
+        errs.Add "工作表「" & ws.Name & "」表头 N2 应为「折旧额」。"
+    End If
+    If InStr(SafeText(ws.Cells(HDR_ROW, C_NET)), "净值") = 0 Then
+        errs.Add "工作表「" & ws.Name & "」表头 O2 应为「净值」。"
+    End If
+End Sub
+
+Private Sub ScanFormulaErrors(ByVal ws As Worksheet, ByVal totalRow As Long, ByRef errs As Collection)
+    Dim rng As Range, cell As Range
+    Dim cnt As Long
+    Set rng = ws.Range(ws.Cells(1, 1), ws.Cells(totalRow, C_NET))
+    For Each cell In rng.Cells
+        If IsError(cell.Value) Then
+            errs.Add "工作表「" & ws.Name & "」单元格 " & cell.Address(False, False) & " 存在公式错误：" & cell.Text
+            cnt = cnt + 1
+            If cnt >= 10 Then Exit For
+        End If
+    Next
+End Sub
+
+Private Sub EnsureSalvageColumn(ByVal ws As Worksheet)
+    If SafeText(ws.Cells(HDR_ROW, C_SALV)) <> "预计净残值" Then
+        ws.Cells(HDR_ROW, C_SALV).Value = "预计净残值"
+    End If
+    ws.Columns(C_SALV).Hidden = True
+End Sub
+
+Private Sub MarkChange(ByVal ws As Worksheet, ByVal r As Long, ByVal tag As String)
+    Dim b As String, j As String
+    b = SafeText(ws.Cells(r, C_CHG))
+    j = SafeText(ws.Cells(r, C_MEMO))
+    If Len(b) = 0 Then
+        ws.Cells(r, C_CHG).Value = tag
+    ElseIf InStr(b, tag) = 0 Then
+        AppendMemo ws, r, tag
+    End If
+End Sub
+
+Private Sub AppendMemo(ByVal ws As Worksheet, ByVal r As Long, ByVal txt As String)
+    Dim j As String
+    j = SafeText(ws.Cells(r, C_MEMO))
+    If Len(j) = 0 Then
+        ws.Cells(r, C_MEMO).Value = txt
+    ElseIf InStr(j, txt) = 0 Then
+        ws.Cells(r, C_MEMO).Value = j & "；" & txt
+    End If
+End Sub
+
+Private Function FindChange(ByVal items As Collection, ByVal assetNo As String) As Long
+    Dim i As Long
+    Dim it As CChangeItem
+    For i = 1 To items.Count
+        Set it = items(i)
+        If it.assetNo = assetNo Then
+            FindChange = i
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function SeenAdd(ByVal seen As Collection, ByVal key As String) As Boolean
+    On Error Resume Next
+    seen.Add key, key
+    SeenAdd = (Err.Number <> 0)
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Function SeenExists(ByVal seen As Collection, ByVal key As String) As Boolean
+    On Error Resume Next
+    Dim v As String
+    v = seen(key)
+    SeenExists = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Function TryGetNum(ByVal cell As Range, ByRef v As Double, ByVal allowEmpty As Boolean) As Boolean
+    If IsError(cell.Value) Then Exit Function
+    If IsEmpty(cell.Value) Or Len(Trim$(CStr(cell.Value))) = 0 Then
+        If allowEmpty Then
+            v = 0
+            TryGetNum = True
+        End If
+        Exit Function
+    End If
+    If Not IsNumeric(cell.Value) Then Exit Function
+    v = CDbl(cell.Value)
+    TryGetNum = True
+End Function
+
+Private Function RulesValid(ByVal ruleNew As String, ByVal ruleMin As String, _
+        ByVal ruleScrap As String) As Boolean
+    RulesValid = ((ruleNew = OPT_NEW_NOW) Or (ruleNew = OPT_NEW_NEXT)) And _
+                 ((ruleMin = OPT_MIN_ZERO) Or (ruleMin = OPT_MIN_SALV)) And _
+                 ((ruleScrap = OPT_SCRAP_YES) Or (ruleScrap = OPT_SCRAP_NO))
+End Function
+
+Private Function IsPositiveNumber(ByVal v As Variant) As Boolean
+    If IsError(v) Or IsEmpty(v) Then Exit Function
+    If Not IsNumeric(v) Then Exit Function
+    IsPositiveNumber = (CDbl(v) > 0)
+End Function
+
+Private Function IsNonNegativeNumber(ByVal v As Variant) As Boolean
+    If IsError(v) Or IsEmpty(v) Then Exit Function
+    If Not IsNumeric(v) Then Exit Function
+    IsNonNegativeNumber = (CDbl(v) >= 0)
+End Function
+
+Private Function SafeText(ByVal cell As Range) As String
+    On Error Resume Next
+    If IsError(cell.Value) Then
+        SafeText = ""
+    Else
+        SafeText = Trim$(CStr(cell.Value))
+    End If
+    On Error GoTo 0
+End Function
+
+'读取财产编号：文本直接取；数值按显示文本取（兼容 "0001" 等前导零格式）
+Private Function AssetNoOf(ByVal cell As Range) As String
+    On Error Resume Next
+    If IsError(cell.Value) Then Exit Function
+    If IsEmpty(cell.Value) Then Exit Function
+    If VarType(cell.Value) = vbString Then
+        AssetNoOf = Trim$(cell.Value)
+    Else
+        AssetNoOf = Trim$(cell.Text)
+        If InStr(AssetNoOf, "#") > 0 Or Len(AssetNoOf) = 0 Then
+            AssetNoOf = Trim$(CStr(cell.Value))
+        End If
+    End If
+    On Error GoTo 0
+End Function
+
+Private Function FileExists(ByVal p As String) As Boolean
+    On Error Resume Next
+    FileExists = (Len(Dir$(p, vbNormal)) > 0)
+    On Error GoTo 0
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal nm As String) As Boolean
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets(nm)
+    SheetExists = Not ws Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function ParentFolder(ByVal path As String) As String
+    Dim p As Long
+    p = InStrRev(path, "\")
+    If InStrRev(path, "/") > p Then p = InStrRev(path, "/")
+    If p > 0 Then
+        ParentFolder = Replace(Left$(path, p - 1), "/", "\")
+    Else
+        ParentFolder = path
+    End If
+End Function
+
+'锁定首页版式，防止误改；仅开放折旧规则和“本月资产变动”输入区。
+'UserInterfaceOnly 让按钮宏仍可更新锁定的状态、路径和期间单元格。
+Private Sub ProtectHomeSheet()
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = Home
+    ws.Unprotect
+    ws.Cells.Locked = True
+    ws.Range(CELL_RULE_NEW).MergeArea.Locked = False
+    ws.Range(CELL_RULE_MIN).MergeArea.Locked = False
+    ws.Range(CELL_RULE_SCRAP).MergeArea.Locked = False
+    ws.Range("A" & CHG_FIRST_ROW & ":M" & CHG_LAST_ROW).Locked = False
+    ws.Protect UserInterfaceOnly:=True
+    ws.EnableSelection = xlUnlockedCells
+    On Error GoTo 0
+End Sub
+
+Private Function PickFolder() As String
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFolderPicker)
+    fd.Title = "请选择保存文件夹"
+    If fd.Show = -1 Then PickFolder = fd.SelectedItems(1)
+End Function
+
+Private Function OpenSource(ByVal path As String) As Workbook
+    Dim oldAsk As Boolean
+    oldAsk = Application.AskToUpdateLinks
+    Application.AskToUpdateLinks = False
+    On Error GoTo Fail
+    Set OpenSource = Application.Workbooks.Open(Filename:=path, UpdateLinks:=0, ReadOnly:=True)
+    Application.AskToUpdateLinks = oldAsk
+    Exit Function
+Fail:
+    Application.AskToUpdateLinks = oldAsk
+    Err.Raise Err.Number, , "无法打开上月文件：" & Err.Description
+End Function
+
+Private Sub DeletePreviewSheet()
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = ToolWorkbook.Worksheets(SHEET_PREVIEW)
+    On Error GoTo 0
+    If Not ws Is Nothing Then
+        Application.DisplayAlerts = False
+        ws.Delete
+        Application.DisplayAlerts = True
+    End If
+End Sub
+
+Private Function CountSeverity(ByVal results As Collection, ByVal sev As Long) As Long
+    If results Is Nothing Then Exit Function
+    Dim i As Long, res As CResultRow
+    For i = 1 To results.Count
+        Set res = results(i)
+        If res.Severity = sev Then CountSeverity = CountSeverity + 1
+    Next
+End Function
+
+Private Function FirstErrors(ByVal errs As Collection, ByVal results As Collection, ByVal maxN As Long) As String
+    Dim s As String, n As Long, i As Long
+    Dim res As CResultRow
+    If Not errs Is Nothing Then
+        For i = 1 To errs.Count
+            If n >= maxN Then Exit For
+            s = s & "· " & errs(i) & vbCrLf
+            n = n + 1
+        Next
+    End If
+    If Not results Is Nothing Then
+        For i = 1 To results.Count
+            If n >= maxN Then Exit For
+            Set res = results(i)
+            If res.Severity = 2 Then
+                s = s & "· " & res.CheckMsg & vbCrLf
+                n = n + 1
+            End If
+        Next
+    End If
+    If Len(s) = 0 Then s = "（详见「" & SHEET_PREVIEW & "」工作表）"
+    FirstErrors = s
+End Function
+
+
